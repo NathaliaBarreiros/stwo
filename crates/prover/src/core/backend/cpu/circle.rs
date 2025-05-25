@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use super::CpuBackend;
 use crate::core::backend::cpu::bit_reverse;
+use crate::core::backend::simd::m31::LOG_N_LANES;
 use crate::core::backend::Col;
 use crate::core::circle::{CirclePoint, CirclePointIndex, Coset};
 use crate::core::constraints::{coset_vanishing, coset_vanishing_derivative, point_vanishing};
@@ -124,39 +125,38 @@ impl PolyOps for CpuBackend {
                     p_0_inverse,
                 ));
 
-        // TODO(Gali): Optimize to a batched point_vanishing()
-        #[cfg(not(feature = "parallel"))]
-        let domain_points_vanishing_evaluated_at_point = (0..domain.size())
-            .map(|i| {
-                point_vanishing(
-                    domain
-                        .at(bit_reverse_index(i, log_size))
-                        .into_ef::<SecureField>(),
-                    sample_point.into_ef::<SecureField>(),
+        let inversed_domain_points_vanishing_evaluated_at_point: Vec<SecureField> =
+            if domain.log_size() < LOG_N_LANES {
+                (0..domain.size())
+                    .map(|i| {
+                        SecureField::one()
+                            / point_vanishing(
+                                domain
+                                    .at(bit_reverse_index(i, log_size))
+                                    .into_ef::<SecureField>(),
+                                sample_point.into_ef::<SecureField>(),
+                            )
+                    })
+                    .collect()
+            } else {
+                let mut domain_points_vanishing_evaluated_at_point_numerator =
+                    vec![unsafe { std::mem::zeroed() }; domain.size()];
+                let mut domain_points_vanishing_evaluated_at_point_denominator =
+                    vec![unsafe { std::mem::zeroed() }; domain.size()];
+
+                calculate_vanishing_domain_points_evaluations_in_chunks(
+                    &domain,
+                    sample_point,
+                    &mut domain_points_vanishing_evaluated_at_point_numerator,
+                    &mut domain_points_vanishing_evaluated_at_point_denominator,
+                );
+
+                calculate_inversed_vanishing_domain_points_evaluations(
+                    &domain,
+                    &domain_points_vanishing_evaluated_at_point_numerator,
+                    &domain_points_vanishing_evaluated_at_point_denominator,
                 )
-            })
-            .collect_vec();
-
-        #[cfg(feature = "parallel")]
-        let domain_points_vanishing_evaluated_at_point: Vec<_> = (0..domain.size())
-            .into_par_iter()
-            .map(|i| {
-                point_vanishing(
-                    domain
-                        .at(bit_reverse_index(i, log_size))
-                        .into_ef::<SecureField>(),
-                    sample_point.into_ef::<SecureField>(),
-                )
-            })
-            .collect();
-
-        let mut inversed_domain_points_vanishing_evaluated_at_point =
-            vec![unsafe { std::mem::zeroed() }; domain.size()];
-
-        batch_inverse_in_place(
-            &domain_points_vanishing_evaluated_at_point,
-            &mut inversed_domain_points_vanishing_evaluated_at_point,
-        );
+            };
 
         let coset_vanishing_evaluated_at_point: SecureField = coset_vanishing(
             CanonicCoset::new(domain.log_size()).coset,
@@ -376,6 +376,164 @@ impl<F: ExtensionOf<BaseField>, EvalOrder> IntoIterator
     fn into_iter(self) -> Self::IntoIter {
         self.values.into_iter()
     }
+}
+
+fn calculate_vanishing_domain_points_evaluations(
+    domain: &CircleDomain,
+    sample_point: CirclePoint<SecureField>,
+    i: usize,
+    domain_points_vanishing_evaluated_at_point_numerator: &mut [SecureField],
+    domain_points_vanishing_evaluated_at_point_denominator: &mut [SecureField],
+    reverse: bool,
+) {
+    let p = domain.at(i).into_ef::<SecureField>();
+
+    let qx_px = sample_point.x * p.x;
+    let qx_py = sample_point.x * p.y;
+    let qy_px = sample_point.y * p.x;
+    let qy_py = sample_point.y * p.y;
+
+    if reverse {
+        // (Px,Py)
+        domain_points_vanishing_evaluated_at_point_numerator[4] = qy_px - qx_py;
+        domain_points_vanishing_evaluated_at_point_denominator[4] =
+            qx_px + qy_py + SecureField::one();
+
+        // (-Py,Px)
+        domain_points_vanishing_evaluated_at_point_numerator[5] = -qy_py - qx_px;
+        domain_points_vanishing_evaluated_at_point_denominator[5] =
+            -qx_py + qy_px + SecureField::one();
+
+        // (-Px,-Py)
+        domain_points_vanishing_evaluated_at_point_numerator[6] = -qy_px + qx_py;
+        domain_points_vanishing_evaluated_at_point_denominator[6] =
+            -qx_px - qy_py + SecureField::one();
+
+        // (Py,-Px)
+        domain_points_vanishing_evaluated_at_point_numerator[7] = qy_py + qx_px;
+        domain_points_vanishing_evaluated_at_point_denominator[7] =
+            qx_py - qy_px + SecureField::one();
+    } else {
+        // (Px,Py)
+        domain_points_vanishing_evaluated_at_point_numerator[0] = qy_px - qx_py;
+        domain_points_vanishing_evaluated_at_point_denominator[0] =
+            qx_px + qy_py + SecureField::one();
+
+        // (Py,-Px)
+        domain_points_vanishing_evaluated_at_point_numerator[1] = qy_py + qx_px;
+        domain_points_vanishing_evaluated_at_point_denominator[1] =
+            qx_py - qy_px + SecureField::one();
+
+        // (-Px,-Py)
+        domain_points_vanishing_evaluated_at_point_numerator[2] = -qy_px + qx_py;
+        domain_points_vanishing_evaluated_at_point_denominator[2] =
+            -qx_px - qy_py + SecureField::one();
+
+        // (-Py,Px)
+        domain_points_vanishing_evaluated_at_point_numerator[3] = -qy_py - qx_px;
+        domain_points_vanishing_evaluated_at_point_denominator[3] =
+            -qx_py + qy_px + SecureField::one();
+    }
+}
+
+fn calculate_vanishing_domain_points_evaluations_in_chunks(
+    domain: &CircleDomain,
+    sample_point: CirclePoint<SecureField>,
+    numerator: &mut [SecureField],
+    denominator: &mut [SecureField],
+) {
+    #[cfg(not(feature = "parallel"))]
+    numerator
+        .chunks_mut(8)
+        .zip(denominator.chunks_mut(8))
+        .enumerate()
+        .into_iter()
+        .for_each(|(i, (num_chunk, denom_chunk))| {
+            calculate_vanishing_domain_points_evaluations(
+                domain,
+                sample_point,
+                i,
+                num_chunk,
+                denom_chunk,
+                false,
+            );
+            calculate_vanishing_domain_points_evaluations(
+                domain,
+                sample_point,
+                i + domain.size() / 2,
+                num_chunk,
+                denom_chunk,
+                true,
+            );
+        });
+
+    #[cfg(feature = "parallel")]
+    numerator
+        .par_chunks_mut(8)
+        .zip(denominator.par_chunks_mut(8))
+        .enumerate()
+        .for_each(|(i, (num_chunk, denom_chunk))| {
+            calculate_vanishing_domain_points_evaluations(
+                domain,
+                sample_point,
+                i,
+                num_chunk,
+                denom_chunk,
+                false,
+            );
+            calculate_vanishing_domain_points_evaluations(
+                domain,
+                sample_point,
+                i + domain.size() / 2,
+                num_chunk,
+                denom_chunk,
+                true,
+            );
+        });
+}
+
+fn calculate_inversed_vanishing_domain_points_evaluations(
+    domain: &CircleDomain,
+    numerator: &[SecureField],
+    denominator: &[SecureField],
+) -> Vec<SecureField> {
+    let mut inversed_numerator = vec![unsafe { std::mem::zeroed() }; domain.size()];
+
+    batch_inverse_in_place(numerator, &mut inversed_numerator);
+
+    let half_size = domain.size() / 2;
+    let half_size_div_4 = half_size / 4;
+
+    #[cfg(not(feature = "parallel"))]
+    let result = (0..domain.size())
+        .map(|i| {
+            let idx = bit_reverse_index(i, domain.log_size());
+            if idx < half_size {
+                inversed_numerator[2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+                    * denominator[2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+            } else {
+                inversed_numerator[4 + 2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+                    * denominator[4 + 2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+            }
+        })
+        .collect_vec();
+
+    #[cfg(feature = "parallel")]
+    let result: Vec<_> = (0..domain.size())
+        .into_par_iter()
+        .map(|i| {
+            let idx = bit_reverse_index(i, domain.log_size());
+            if idx < half_size {
+                inversed_numerator[2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+                    * denominator[2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+            } else {
+                inversed_numerator[4 + 2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+                    * denominator[4 + 2 * 4 * (idx % half_size_div_4) + (idx % 4)]
+            }
+        })
+        .collect();
+
+    result
 }
 
 #[cfg(test)]

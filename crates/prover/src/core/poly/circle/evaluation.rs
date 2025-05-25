@@ -297,7 +297,7 @@ mod tests {
                 .map(BaseField::from)
                 .to_vec(),
         ));
-        let s = CanonicCoset::new(3);
+        let s = CanonicCoset::new(6);
         let domain = s.circle_domain();
         let eval = poly.evaluate(domain);
         let sampled_points = [
